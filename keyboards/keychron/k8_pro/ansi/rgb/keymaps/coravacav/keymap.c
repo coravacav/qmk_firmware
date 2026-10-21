@@ -23,12 +23,20 @@ enum layers{
   CAPS,
   CAPS_SPACE,
   FN,
+  MOUSE,
 };
 
 enum custom_keycodes {
      MOD_SPC = SAFE_RANGE,
      RND_CASE,
      L33T_SPK,
+     // Mouse mode (Caps + '): jump the cursor instead of gliding it.
+     MJ_UP, MJ_DOWN, MJ_LEFT, MJ_RGHT,        // jump by the current size
+     MJ_TL, MJ_TR, MJ_BL, MJ_BR,              // snap to a screen corner
+     MJ_EDGE,                                 // next jump goes to the screen edge
+     MJ_SMLR, MJ_REP, MJ_LRGR,                // repeat last jump at half / same / double size
+     MJ_UNDO,                                 // undo the last jump
+     MJ_SZ1, MJ_SZ2, MJ_SZ3, MJ_SZ4, MJ_SZ5,  // set the jump size
 };
 
 static bool random_case_enabled = false;
@@ -47,7 +55,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
      _______,         KC_F13,   KC_F14,  KC_F15,    KC_F16,   KC_F17,   KC_F18,   KC_F19,   KC_F20,   KC_F21,   KC_F22,   KC_F23,   KC_F24,            _______,   _______,  _______,
      _______,        KC_BSPC,   KC_DEL,  KC_ENT,   _______,  _______,  _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,   _______,  _______,
      _______,        MS_BTN1,   KC_F20, MS_BTN2,   KC_PGUP,  MS_WHLU,   KC_INS,  KC_BSPC,    KC_UP,   KC_DEL,  _______,  _______,  _______,  _______,  _______,   _______,  _______,
-     _______,        KC_HOME,   KC_END, MOD_SPC,   KC_PGDN,  MS_WHLD,   KC_ESC,  KC_LEFT,  KC_DOWN,  KC_RGHT,   KC_ENT,  _______,            _______,
+     _______,        KC_HOME,   KC_END, MOD_SPC,   KC_PGDN,  MS_WHLD,   KC_ESC,  KC_LEFT,  KC_DOWN,  KC_RGHT,   KC_ENT,  MO(MOUSE),          _______,
      _______,        DM_PLY1,  DM_PLY2,  KC_APP,   QK_REP,   QK_REP,   QK_REP,   QK_REP,   _______,  _______,  _______,                      _______,             _______,
      _______,        _______,  _______,                                MO(CAPS_SPACE),                         _______,  _______,  _______,  _______,  _______,   _______,  _______),
 
@@ -66,13 +74,149 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
      XXXXXXX,        UG_PREV , UG_VALD,  UG_HUED,  UG_SATD,  UG_SPDD,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,            XXXXXXX,
      XXXXXXX,        RND_CASE, L33T_SPK, XXXXXXX,  XXXXXXX,  BAT_LVL,  NK_TOGG,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                      XXXXXXX,            XXXXXXX,
      XXXXXXX,        XXXXXXX,  XXXXXXX,                                XXXXXXX,                                XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,   XXXXXXX),
+
+[MOUSE] = LAYOUT_tkl_ansi(
+     _______,        _______,  _______, _______,   _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            _______,   _______,  _______,
+     _______,         MJ_SZ1,   MJ_SZ2,  MJ_SZ3,    MJ_SZ4,   MJ_SZ5,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,   _______,  _______,
+     _______,        MS_BTN1,  MS_BTN3, MS_BTN2,   _______,  MS_WHLU,  _______,    MJ_TL,    MJ_UP,    MJ_TR,  _______,  _______,  _______,  _______,  _______,   _______,  _______,
+     _______,        MJ_SMLR,   MJ_REP, MJ_LRGR,   MJ_EDGE,  MS_WHLD,  _______,  MJ_LEFT,  MJ_DOWN,  MJ_RGHT,  _______,  _______,            _______,
+     _______,        MJ_UNDO,  _______, _______,   _______,  _______,  _______,    MJ_BL,  _______,    MJ_BR,  _______,                      _______,             _______,
+     _______,        _______,  _______,                                MS_BTN1,                                _______,  _______,  _______,  _______,  _______,   _______,  _______),
 };
+// clang-format on
+
+// Mouse mode. A jump is sent as a run of small, evenly spaced reports, so the
+// OS pointer acceleration treats a given size the same way every time.
+#define MJ_STEP 16         // largest move per report for normal jumps
+#define MJ_EDGE_STEP 127   // largest move per report for edge and corner jumps
+#define MJ_EDGE_DIST 3000  // far enough to reach the edge of any screen
+#define MJ_INTERVAL_MS 8   // time between reports
+#define MJ_SIZE_MAX 2000
+#define MJ_HISTORY 16
+
+static const uint16_t mj_sizes[] = {10, 25, 50, 100, 250};
+static uint16_t mj_size = 50;
+static int8_t mj_dir_x, mj_dir_y;  // direction of the last normal jump
+static bool mj_edge_next = false;
+
+// Normal jumps since the last edge or corner jump, for undo.
+static int16_t mj_history[MJ_HISTORY][2];
+static uint8_t mj_history_len = 0;
+
+static int32_t mj_pending_x, mj_pending_y;
+static uint8_t mj_step;
+static uint16_t mj_timer;
+
+static void mj_queue(int32_t dx, int32_t dy, uint8_t step) {
+  if (!mj_pending_x && !mj_pending_y) {
+    mj_step = step;
+    mj_timer = timer_read() - MJ_INTERVAL_MS;  // send the first report right away
+  }
+  mj_pending_x += dx;
+  mj_pending_y += dy;
+}
+
+static void mj_jump(int8_t dir_x, int8_t dir_y) {
+  int16_t dx = dir_x * mj_size, dy = dir_y * mj_size;
+  if (mj_history_len == MJ_HISTORY) {
+    memmove(mj_history[0], mj_history[1], sizeof(mj_history[0]) * (MJ_HISTORY - 1));
+    mj_history_len--;
+  }
+  mj_history[mj_history_len][0] = dx;
+  mj_history[mj_history_len][1] = dy;
+  mj_history_len++;
+  mj_dir_x = dir_x;
+  mj_dir_y = dir_y;
+  mj_queue(dx, dy, MJ_STEP);
+}
+
+// The screen edge stops the cursor, so these land in the same place every time.
+// The keyboard can't tell how far the cursor really moved, so undo starts over.
+static void mj_to_edge(int8_t dir_x, int8_t dir_y) {
+  mj_history_len = 0;
+  mj_queue(dir_x * MJ_EDGE_DIST, dir_y * MJ_EDGE_DIST, MJ_EDGE_STEP);
+}
+
+static void mj_direction(int8_t dir_x, int8_t dir_y) {
+  if (mj_edge_next) {
+    mj_edge_next = false;
+    mj_to_edge(dir_x, dir_y);
+  } else {
+    mj_jump(dir_x, dir_y);
+  }
+}
+
+static void mj_repeat(void) {
+  if (mj_dir_x || mj_dir_y) mj_jump(mj_dir_x, mj_dir_y);
+}
+
+static int8_t mj_take(int32_t *pending) {
+  int32_t d = *pending;
+  if (d > mj_step) d = mj_step;
+  if (d < -mj_step) d = -mj_step;
+  *pending -= d;
+  return d;
+}
+
+void housekeeping_task_user(void) {
+  if ((!mj_pending_x && !mj_pending_y) || timer_elapsed(mj_timer) < MJ_INTERVAL_MS) return;
+  mj_timer = timer_read();
+  report_mouse_t report = mousekey_get_report();  // keeps held buttons, e.g. a drag
+  report.x = mj_take(&mj_pending_x);
+  report.y = mj_take(&mj_pending_y);
+  report.v = 0;
+  report.h = 0;
+  host_mouse_send(&report);
+}
+
+layer_state_t layer_state_set_user(layer_state_t state) {
+  if (!layer_state_cmp(state, MOUSE)) mj_edge_next = false;
+  return state;
+}
+
+static bool process_mouse_jump(uint16_t keycode, keyrecord_t *record) {
+  if (keycode < MJ_UP || keycode > MJ_SZ5) return true;
+  if (!record->event.pressed) return false;
+
+  switch (keycode) {
+    case MJ_UP:   mj_direction(0, -1); break;
+    case MJ_DOWN: mj_direction(0, 1); break;
+    case MJ_LEFT: mj_direction(-1, 0); break;
+    case MJ_RGHT: mj_direction(1, 0); break;
+    case MJ_TL:   mj_to_edge(-1, -1); break;
+    case MJ_TR:   mj_to_edge(1, -1); break;
+    case MJ_BL:   mj_to_edge(-1, 1); break;
+    case MJ_BR:   mj_to_edge(1, 1); break;
+    case MJ_EDGE: mj_edge_next = !mj_edge_next; break;
+    case MJ_SMLR:
+      if (mj_size > 1) mj_size /= 2;
+      mj_repeat();
+      break;
+    case MJ_REP: mj_repeat(); break;
+    case MJ_LRGR:
+      if (mj_size * 2 <= MJ_SIZE_MAX) mj_size *= 2;
+      mj_repeat();
+      break;
+    case MJ_UNDO:
+      if (mj_history_len) {
+        mj_history_len--;
+        mj_queue(-mj_history[mj_history_len][0], -mj_history[mj_history_len][1], MJ_STEP);
+      }
+      break;
+    default:  // MJ_SZ1 .. MJ_SZ5
+      mj_size = mj_sizes[keycode - MJ_SZ1];
+      break;
+  }
+  return false;
+}
 
 bool is_alpha(uint16_t keycode) {
   return keycode >= KC_A && keycode <= KC_Z;
 }
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+  if (!process_mouse_jump(keycode, record)) return false;
+
   switch (keycode) {
     case MOD_SPC:
       if (record->event.pressed) {
